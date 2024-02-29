@@ -633,4 +633,10 @@ postgres=# select * from test;
 ```
 WELL DONE! We can see that the data is still there!
 ## Conclusion
-... to be continued
+We have created a new VM with Ubuntu 20.04 on Yandex Cloud. We have practiced the following:
+- installing PostgreSQL 14 using `sudo apt`
+- using yc CLI to create a new subnet, a new disk, and attach it to the VM
+- creating a new disk for the VM, attaching it, and mounting it to `/mnt/data`
+- moving the data from `/var/lib/postgresql/14` to `/mnt/data`
+- configuring PostgreSQL to use the new data directory
+- starting a new PostgreSQL clustre on a new VM using the data from the old VM
