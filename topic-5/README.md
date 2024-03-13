@@ -345,7 +345,7 @@ postgres=# SELECT pg_relation_filepath('test_table');
  base/5/16465
 (1 row)
 ```
-Выведем путь до каталога с данными PostgreSQL
+### Выведем путь до каталога с данными PostgreSQL
 ```psql
 postgres=# SHOW data_directory;
        data_directory
