@@ -215,9 +215,15 @@ postgres=# SELECT relation::REGCLASS, locktype, mode, granted, pid, pg_blocking_
  accounts | tuple    | ExclusiveLock    | t       | 135 | {70}     |
 (5 rows)
 ```
-*Видим, что сессия с pid=208 ожидает блокировку типа `ExclusiveLock` от сессии с pid=135.*
-*Сессия с pid=135 получила блокировку типа `ExclusiveLock` на строке таблицы `accounts`.*
+*Видим, что сессия с pid=208 ожидает исключительную блокировку версии строки типа `ExclusiveLock` от сессии с pid=135.*
+*Сессия с pid=135 получила исключительную блокировку версии строки типа `ExclusiveLock`.*
 *Вместе с этим все сессии успешно получили и удерживают блокировку типа `RowExclusiveLock` на таблице `accounts`, так-как значение `granted` равно `t` (блокировку в этом режиме получает любая команда, которая изменяет данные в таблице)*
+
+**Когда транзакция собирается изменить строку, она выполняет следующую последовательность действий:**
+1. Захватывает исключительную блокировку изменяемой версии строки (tuple).
+2. Если xmax и информационные биты говорят о том, что строка заблокирована, то запрашивает блокировку номера транзакции xmax.
+3. Прописывает свой xmax и необходимые информационные биты.
+4. Освобождает блокировку версии строки.
 
 > `mode (text)`
 >
@@ -227,7 +233,7 @@ postgres=# SELECT relation::REGCLASS, locktype, mode, granted, pid, pg_blocking_
 
 > `locktype (text)`
 >
-> Тип блокируемого объекта: relation (отношение), extend (расширение отношения), frozenid (замороженный идентификатор), page (страница), tuple (кортеж), transactionid (идентификатор транзакции), virtualxid (виртуальный идентификатор), spectoken (спекулятивный маркер), object (объект), userlock (пользовательская блокировка) или advisory (рекомендательная)
+> Тип блокируемого объекта: `relation` (ожидание при запросе блокировки для отношения), `tuple` (ожидание при запросе блокировки для кортежа).
 >
 > См. далее: https://postgrespro.ru/docs/postgrespro/15/monitoring-stats#WAIT-EVENT-LOCK-TABLE
 
@@ -343,3 +349,401 @@ postgres=# SELECT relation::REGCLASS, locktype, mode, granted, pid, pg_blocking_
 (0 rows)
 ```
 *Видим, что блокировок больше нет*
+
+## 3. Взаимная блокировка трех транзакций
+### Проверим `deadlock_timeout`
+```psql
+postgres=# SHOW deadlock_timeout;
+ deadlock_timeout
+------------------
+ 1s
+(1 row)
+```
+> `deadlock_timeout (integer)`
+>
+> Время в миллисекундах, в течение которого сервер будет ожидать разрешения взаимоблокировки. Если взаимоблокировка не разрешится в течение этого времени, сервер прервет одну из транзакций, чтобы разрешить взаимоблокировку. Значение по умолчанию - 1 секунда.
+>
+> См. далее: https://postgrespro.ru/docs/postgrespro/15/runtime-config-client#GUC-DEADLOCK-TIMEOUT
+
+### Воссоздадим ситуацию взаимоблокировки трех транзакций. Добавим данные в таблицу `accounts`
+```psql
+postgres=# INSERT INTO accounts (name, balance) VALUES ('Alice', 1000), ('Bob', 2000), ('Charlie', 3000);
+INSERT 0 3
+```
+### Проверим содержимое таблицы accounts
+```psql
+postgres=# select * from accounts;
+ id |  name   | balance
+----+---------+---------
+  4 | Alice   |    1000
+  5 | Bob     |    2000
+  6 | Charlie |    3000
+(3 rows)
+```
+
+### В первом терминале (pid=70) будем переводить деньги от Alice к Bob. Уменьшим баланс Alice на 100
+```psql
+[70] postgres=# BEGIN;
+BEGIN
+[70] postgres=#* UPDATE accounts SET balance = balance - 100 WHERE name = 'Alice';
+UPDATE 1
+```
+### Во втором терминале (pid=135) будем переводить деньги от Bob к Charlie. Уменьшим баланс Bob на 200
+```psql
+[135] postgres=# BEGIN;
+BEGIN
+[135] postgres=#* UPDATE accounts SET balance = balance - 200 WHERE name = 'Bob';
+UPDATE 1
+```
+### В третьем терминале (pid=208) будем переводить деньги от Charlie к Alice. Уменьшим баланс Charlie на 300
+```psql
+[208] postgres=# BEGIN;
+BEGIN
+[208] postgres=#* UPDATE accounts SET balance = balance - 300 WHERE name = 'Charlie';
+UPDATE 1
+```
+### В первом терминале (pid=70) увеличим баланс Bob на 100
+```psql
+[70] postgres=#* UPDATE accounts SET balance = balance + 100 WHERE name = 'Bob';
+```
+### Во втором терминале (pid=135) увеличим баланс Charlie на 200
+```psql
+[135] postgres=#* UPDATE accounts SET balance = balance + 200 WHERE name = 'Charlie';
+```
+### В третьем терминале (pid=208) увеличим баланс Alice на 300
+```psql
+[208] postgres=#* UPDATE accounts SET balance = balance + 300 WHERE name = 'Alice';
+ERROR:  deadlock detected
+DETAIL:  Process 208 waits for ShareLock on transaction 775; blocked by process 70.
+Process 70 waits for ShareLock on transaction 776; blocked by process 135.
+Process 135 waits for ShareLock on transaction 777; blocked by process 208.
+HINT:  See server log for query details.
+CONTEXT:  while updating tuple (0,1) in relation "accounts"
+[208] postgres=#! COMMIT;
+ROLLBACK
+```
+### Коммитим транзакции в сессиях с pid=70 и pid=135
+```psql
+[70] postgres=# COMMIT;
+COMMIT
+```
+```psql
+[135] postgres=# COMMIT;
+COMMIT
+```
+### Посмотрим состояние данных в таблице accounts
+```psql
+postgres=#  select * from accounts;
+ id |  name   | balance
+----+---------+---------
+  4 | Alice   |     900
+  6 | Charlie |    3200
+  5 | Bob     |    1900
+(3 rows)
+```
+*Благодаря тому, что перевод от Charlie к Alice происходил в рамках одной транзакции, данные в таблице accounts остались целостными*
+
+### Изучим логи в терминале
+```log
+2024-04-16T21:17:44.251190805Z 2024-04-16 21:17:44.249 UTC [70] LOG:  process 70 still waiting for ShareLock on transaction 776 after 1006.040 ms
+2024-04-16T21:17:44.252650597Z 2024-04-16 21:17:44.249 UTC [70] DETAIL:  Process holding the lock: 135. Wait queue: 70.
+2024-04-16T21:17:44.252687180Z 2024-04-16 21:17:44.249 UTC [70] CONTEXT:  while updating tuple (0,2) in relation "accounts"
+2024-04-16T21:17:44.252693972Z 2024-04-16 21:17:44.249 UTC [70] STATEMENT:  UPDATE accounts SET balance = balance + 100 WHERE name = 'Bob';
+```
+*В логах видим сообщение о взаимоблокировке: `process 70 still waiting for ShareLock on transaction 776 after 1006.040 ms`. Сессия с pid=70 ожидает блокировку ShareLock от сессии с pid=135. Это произошло в момент выполнения запроса на увеличение баланса Bob на 100*
+```log
+2024-04-16T21:18:17.152542042Z 2024-04-16 21:18:17.149 UTC [135] LOG:  process 135 still waiting for ShareLock on transaction 777 after 1001.348 ms
+2024-04-16T21:18:17.153021667Z 2024-04-16 21:18:17.149 UTC [135] DETAIL:  Process holding the lock: 208. Wait queue: 135.
+2024-04-16T21:18:17.153036750Z 2024-04-16 21:18:17.149 UTC [135] CONTEXT:  while updating tuple (0,3) in relation "accounts"
+2024-04-16T21:18:17.153042667Z 2024-04-16 21:18:17.149 UTC [135] STATEMENT:  UPDATE accounts SET balance = balance + 200 WHERE name = 'Charlie';
+```
+*Далее логах видим сообщение о взаимоблокировке: `process 135 still waiting for ShareLock on transaction 777 after 1001.348 ms`. Сессия с pid=135 ожидает блокировку ShareLock от сессии с pid=208. Это произошло в момент выполнения запроса на увеличение баланса Charlie на 200*
+```log
+2024-04-16T2:51.801376586Z 2024-04-16 21:18:51.799 UTC [208] LOG:  process 208 detected deadlock while waiting for ShareLock on transaction 775 after 1002.675 ms
+ 2024-04-16 21:18:51.799 UTC [208] DETAIL:  Process holding the lock: 70. Wait queue: .
+ 2024-04-16 21:18:51.799 UTC [208] CONTEXT:  while updating tuple (0,1) in relation "accounts"
+ 2024-04-16 21:18:51.799 UTC [208] STATEMENT:  UPDATE accounts SET balance = balance + 300 WHERE name = 'Alice';
+ 2024-04-16 21:18:51.800 UTC [208] ERROR:  deadlock detected
+ 2024-04-16 21:18:51.800 UTC [208] DETAIL:  Process 208 waits for ShareLock on transaction 775; blocked by process 70.
+ 	Process 70 waits for ShareLock on transaction 776; blocked by process 135.
+ 	Process 135 waits for ShareLock on transaction 777; blocked by process 208.
+ 	Process 208: UPDATE accounts SET balance = balance + 300 WHERE name = 'Alice';
+ 	Process 70: UPDATE accounts SET balance = balance + 100 WHERE name = 'Bob';
+ 	Process 135: UPDATE accounts SET balance = balance + 200 WHERE name = 'Charlie';
+ 2024-04-16 21:18:51.800 UTC [208] HINT:  See server log for query details.
+ 2024-04-16 21:18:51.800 UTC [208] CONTEXT:  while updating tuple (0,1) in relation "accounts"
+ 2024-04-16 21:18:51.800 UTC [208] STATEMENT:  UPDATE accounts SET balance = balance + 300 WHERE name = 'Alice';
+ 2024-04-16 21:18:51.801 UTC [135] LOG:  process 135 acquired ShareLock on transaction 777 after 35653.419 ms
+ 2024-04-16 21:18:51.801 UTC [135] CONTEXT:  while updating tuple (0,3) in relation "accounts"
+ 2024-04-16 21:18:51.801 UTC [135] STATEMENT:  UPDATE accounts SET balance = balance + 200 WHERE name = 'Charlie';
+ 2024-04-16 21:18:51.801 UTC [135] LOG:  duration: 35658.221 ms  statement: UPDATE accounts SET balance = balance + 200 WHERE name = 'Charlie';
+```
+*После возникновения Deadlock в третьем терминале с pid=208, сессия была прервана. В логах видим сообщение: `process 208 detected deadlock while waiting for ShareLock on transaction 775 after 1002.675 ms`.*
+
+### Проверим статистику `pg_stat_database`
+```psql
+postgres=# SELECT * FROM pg_stat_database WHERE datname = 'postgres';
+-[ RECORD 1 ]------------+---------------
+datid                    | 5
+datname                  | postgres
+numbackends              | 4
+xact_commit              | 14788
+xact_rollback            | 13
+blks_read                | 363
+blks_hit                 | 543483
+tup_returned             | 6513597
+tup_fetched              | 105987
+tup_inserted             | 138
+tup_updated              | 48
+tup_deleted              | 54
+conflicts                | 0
+temp_files               | 0
+temp_bytes               | 0
+deadlocks                | 1
+checksum_failures        |
+checksum_last_failure    |
+blk_read_time            | 0
+blk_write_time           | 0
+session_time             | 1755927843.626
+active_time              | 5582267.269
+idle_in_transaction_time | 5410610.177
+sessions                 | 5
+sessions_abandoned       | 0
+sessions_fatal           | 0
+sessions_killed          | 0
+stats_reset              |
+```
+*Видим, что количество `deadlocks` равно 1. Это означает, что за время работы сервера произошла одна взаимоблокировка которая и была зарегистрирована в журнале сервера*
+
+## 4. Поиск блокировок при выполнении UPDATE запроса без WHERE условия
+### Воссоздадим ситуацию блокировки при выполнении UPDATE запроса без WHERE условия
+
+Обычно для выполнения операций которые могут привести к взаимоблокировке, необходимо выполнять блокировки в одном и том же порядке. Например в таблице `accounts` блокировать строки в порядке увеличения `id`.
+
+Поскольку UPDATE запрашивает блокировку последовательно для каждой строки, то если строки блокируются в одном порядке - взаимоблокировки не возникнут.
+
+Следовательно, чтобы воспроизвести взаимоблокировку, нам необходимо воссоздать ситуацию, когда одна транзакция обновляет все строки в таблице в одном порядке, а другая транзакция обновляет все строки в таблице в обратном порядке.
+
+### Установим расширение `pgrowlocks`
+```psql
+postgres=# CREATE EXTENSION pgrowlocks;
+CREATE EXTENSION
+```
+### Создадим таблицу `accounts` и добавим в нее 3 строки
+```psql
+postgres=# CREATE TABLE accounts (id serial PRIMARY KEY, name text, balance integer);
+CREATE TABLE
+postgres=# INSERT INTO accounts (name, balance) VALUES ('Alice', 1000), ('Bob', 2000), ('Charlie', 3000);
+INSERT 0 3
+```
+### Проверим содержимое таблицы `accounts`
+```psql
+postgres=# SELECT * FROM accounts;
+ id |  name   | balance
+----+---------+---------
+  7 | Alice   |    1000
+  8 | Bob     |    2000
+  9 | Charlie |    3000
+(3 rows)
+```
+### Проверим план выполнения запроса
+```psql
+postgres=# EXPLAIN (ANALYZE, BUFFERS) UPDATE accounts SET balance = balance + 1;
+                                                 QUERY PLAN
+-------------------------------------------------------------------------------------------------------------
+ Update on accounts  (cost=0.00..25.00 rows=0 width=0) (actual time=0.341..0.343 rows=0 loops=1)
+   Buffers: shared hit=7
+   ->  Seq Scan on accounts  (cost=0.00..25.00 rows=1200 width=10) (actual time=0.138..0.142 rows=3 loops=1)
+         Buffers: shared hit=1
+ Planning Time: 0.551 ms
+ Execution Time: 1.003 ms
+(6 rows)
+```
+*Видим, что план выполнения запроса предполагает последовательное обновление всех строк в таблице `accounts`. Так-как строки таблицы вставлялись в порядке увеличения `id`, то блокировки строк будут запрашиваться в порядке увеличения `id`*
+
+### Для изменения порядка выполнения запроса будем использовать механизм DECLARE cursor_name CURSOR.
+В целях отладки для каждой сессии будем увеличивать таймаут проверки взаимоблокировок командой
+```sql
+SET LOCAL deadlock_timeout = '30s';
+```
+### В первой сессии (pid=70) добавим курсор для таблицы `accounts` в порядке увеличения `id`
+```psql
+[70] postgres=# BEGIN;
+BEGIN
+[70] postgres=#* SET LOCAL deadlock_timeout = '30s';
+SET
+[70] postgres=#* DECLARE cur CURSOR FOR SELECT * FROM accounts ORDER BY id FOR UPDATE;
+DECLARE CURSOR
+```
+### Во второй сессии (pid=135) добавим курсор для таблицы `accounts` в порядке уменьшения `id`
+```psql
+[135] postgres=# BEGIN;
+BEGIN
+[135] postgres=#* SET LOCAL deadlock_timeout = '30s';
+SET
+[135] postgres=#* DECLARE cur CURSOR FOR SELECT * FROM accounts ORDER BY id DESC FOR UPDATE;
+DECLARE CURSOR
+```
+### В первой сессии (pid=70) продвинем курсор на одну строку
+```psql
+[70] postgres=#* FETCH cur;
+ id | name  | balance
+----+-------+---------
+  7 | Alice |    1004
+(1 row)
+```
+### Во второй сессии (pid=135) продвинем курсор на одну строку
+```psql
+[135] postgres=#* FETCH cur;
+ id |  name   | balance
+----+---------+---------
+  9 | Charlie |    3004
+(1 row)
+```
+### В первой сессии (pid=70) продвинем курсор на следующую строку
+```psql
+[70] postgres=#* FETCH cur;
+ id | name | balance
+----+------+---------
+  8 | Bob  |    2004
+(1 row)
+```
+### Во второй сессии (pid=135) продвинем курсор на следующую строку
+```psql
+[135] postgres=#* FETCH cur;
+-- ожидание блокировки --
+```
+*Видим, что сессия с pid=135 ожидает блокировку строки (name='Bob') от сессии с pid=70*
+### Посмотрим состояние блокировок
+```psql
+postgres=# SELECT * FROM pgrowlocks('accounts') \gx
+-[ RECORD 1 ]--------------
+locked_row | (0,13)
+locker     | 810
+multi      | f
+xids       | {810}
+modes      | {"For Update"}
+pids       | {70}
+-[ RECORD 2 ]--------------
+locked_row | (0,14)
+locker     | 810
+multi      | f
+xids       | {810}
+modes      | {"For Update"}
+pids       | {70}
+-[ RECORD 3 ]--------------
+locked_row | (0,15)
+locker     | 811
+multi      | f
+xids       | {811}
+modes      | {"For Update"}
+pids       | {135}
+```
+### В первой сессии (pid=70) продвинем курсор на следующую строку, чтобы вызвать взаимоблокировку.
+```psql
+[70] postgres=#* FETCH cur;
+-- ожидание блокировки --
+```
+*Видим, что возникло ожидание блокировки строки (name='Charlie') от сессии с pid=135. Тем самым, в обеих транзакциях возникли взаимные ожидания блокировок.*
+
+### Посмотрим состояние блокировок
+```psql
+postgres=# SELECT * FROM pgrowlocks('accounts') \gx
+-[ RECORD 1 ]--------------
+locked_row | (0,13)
+locker     | 810
+multi      | f
+xids       | {810}
+modes      | {"For Update"}
+pids       | {70}
+-[ RECORD 2 ]--------------
+locked_row | (0,14)
+locker     | 810
+multi      | f
+xids       | {810}
+modes      | {"For Update"}
+pids       | {70}
+-[ RECORD 3 ]--------------
+locked_row | (0,15)
+locker     | 811
+multi      | f
+xids       | {811}
+modes      | {"For Update"}
+pids       | {135}
+```
+*Ничего не изменилось, запись о том, что сессия с pid=70 ожидает блокировку строки от сессии с pid=135 отсутствует*
+### В первой сессии (pid=70) через 30 секунд видим сообщение о Deadlock
+```psql
+ERROR:  deadlock detected
+DETAIL:  Process 70 waits for ShareLock on transaction 811; blocked by process 135.
+Process 135 waits for ShareLock on transaction 810; blocked by process 70.
+HINT:  See server log for query details.
+CONTEXT:  while locking tuple (0,15) in relation "accounts"
+```
+### Проверим состояние блокировок
+```psql
+postgres=# SELECT * FROM pgrowlocks('accounts') \gx
+-[ RECORD 1 ]--------------
+locked_row | (0,14)
+locker     | 811
+multi      | f
+xids       | {811}
+modes      | {"For Update"}
+pids       | {135}
+-[ RECORD 2 ]--------------
+locked_row | (0,15)
+locker     | 811
+multi      | f
+xids       | {811}
+modes      | {"For Update"}
+pids       | {135}
+```
+### Коммитим транзакции в сессиях с pid=70 и pid=135
+```psql
+[70] postgres=#! COMMIT;
+ROLLBACK
+```
+```psql
+[135] postgres=#* COMMIT;
+COMMIT
+```
+### Посмотрим состояние блокировок
+```psql
+postgres=# SELECT * FROM pgrowlocks('accounts') \gx
+(0 rows)
+```
+*Видим, что блокировок больше нет*
+
+### Изучим логи в терминале
+```log
+2024-04-17T06:49:26.158525929Z 2024-04-17 06:49:26.155 UTC [135] LOG:  process 135 still waiting for ShareLock on transaction 810 after 30003.154 ms
+2024-04-17T06:49:26.159263304Z 2024-04-17 06:49:26.155 UTC [135] DETAIL:  Process holding the lock: 70. Wait queue: 135.
+2024-04-17T06:49:26.159270971Z 2024-04-17 06:49:26.155 UTC [135] CONTEXT:  while locking tuple (0,14) in relation "accounts"
+2024-04-17T06:49:26.159273388Z 2024-04-17 06:49:26.155 UTC [135] STATEMENT:  FETCH cur;
+2024-04-17T06:51:19.496209718Z 2024-04-17 06:51:19.494 UTC [70] LOG:  process 70 detected deadlock while waiting for ShareLock on transaction 811 after 30006.983 ms
+2024-04-17T06:51:19.496823634Z 2024-04-17 06:51:19.494 UTC [70] DETAIL:  Process holding the lock: 135. Wait queue: .
+2024-04-17T06:51:19.496838634Z 2024-04-17 06:51:19.494 UTC [70] CONTEXT:  while locking tuple (0,15) in relation "accounts"
+2024-04-17T06:51:19.496841384Z 2024-04-17 06:51:19.494 UTC [70] STATEMENT:  FETCH cur;
+2024-04-17T06:51:19.496843301Z 2024-04-17 06:51:19.494 UTC [70] ERROR:  deadlock detected
+2024-04-17T06:51:19.496845218Z 2024-04-17 06:51:19.494 UTC [70] DETAIL:  Process 70 waits for ShareLock on transaction 811; blocked by process 135.
+2024-04-17T06:51:19.496847093Z 	Process 135 waits for ShareLock on transaction 810; blocked by process 70.
+2024-04-17T06:51:19.496868634Z 	Process 70: FETCH cur;
+2024-04-17T06:51:19.496870468Z 	Process 135: FETCH cur;
+2024-04-17T06:51:19.496872176Z 2024-04-17 06:51:19.494 UTC [70] HINT:  See server log for query details.
+2024-04-17T06:51:19.496874009Z 2024-04-17 06:51:19.494 UTC [70] CONTEXT:  while locking tuple (0,15) in relation "accounts"
+2024-04-17T06:51:19.496876593Z 2024-04-17 06:51:19.494 UTC [70] STATEMENT:  FETCH cur;
+2024-04-17T06:51:19.496878551Z 2024-04-17 06:51:19.495 UTC [135] LOG:  process 135 acquired ShareLock on transaction 810 after 143343.360 ms
+2024-04-17T06:51:19.496880384Z 2024-04-17 06:51:19.495 UTC [135] CONTEXT:  while locking tuple (0,14) in relation "accounts"
+2024-04-17T06:51:19.496882259Z 2024-04-17 06:51:19.495 UTC [135] STATEMENT:  FETCH cur;
+2024-04-17T06:51:19.497865884Z 2024-04-17 06:51:19.496 UTC [135] LOG:  duration: 143344.566 ms  statement: FETCH cur;
+```
+*В логах видим сообщения о взаимоблокировке: `process 135 still waiting for ShareLock on transaction 810 after 30003.154 ms` и `process 70 detected deadlock while waiting for ShareLock on transaction 811 after 30006.983 ms`*
+
+## Итоги
+В ходе выполнения домашнего задания мы:
+ - научились настраивать параметры журнала сервера для отслеживания длинных транзакций
+ - изучили механизмы блокировок в PostgreSQL
+ - изучили механизмы поиска блокировок в PostgreSQL с использованием представления `pg_locks` и расширения `pgrowlocks`
+ - рассмотрели примеры взаимоблокировок
+ - рассмотрели примеры записей журнала сервера при возникновении взаимоблокировок
+ - рассмотрели примеры взаимоблокировок при выполнении UPDATE запроса без WHERE условия
