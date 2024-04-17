@@ -215,9 +215,9 @@ postgres=# SELECT relation::REGCLASS, locktype, mode, granted, pid, pg_blocking_
  accounts | tuple    | ExclusiveLock    | t       | 135 | {70}     |
 (5 rows)
 ```
-*Видим, что сессия с pid=208 ожидает исключительную блокировку версии строки типа `ExclusiveLock` от сессии с pid=135.*
-*Сессия с pid=135 получила исключительную блокировку версии строки типа `ExclusiveLock`.*
-*Вместе с этим все сессии успешно получили и удерживают блокировку типа `RowExclusiveLock` на таблице `accounts`, так-как значение `granted` равно `t` (блокировку в этом режиме получает любая команда, которая изменяет данные в таблице)*
+*Видим, что транзакция в сессии с pid=208 ожидает исключительную блокировку версии строки типа `ExclusiveLock` от сессии с pid=135.*
+*Транзакция в сессии с pid=135 получила исключительную блокировку версии строки типа `ExclusiveLock`.*
+*Вместе с этим все транзакции успешно получили и удерживают блокировку типа `RowExclusiveLock` на таблице `accounts`, так-как значение `granted` равно `t` (блокировку в этом режиме получает любая команда, которая изменяет данные в таблице)*
 
 **Когда транзакция собирается изменить строку, она выполняет следующую последовательность действий:**
 1. Захватывает исключительную блокировку изменяемой версии строки (tuple).
@@ -277,13 +277,13 @@ postgres=# SELECT relation::REGCLASS, locktype, mode, granted, pid, pg_blocking_
 2024-04-11 20:31:06.564 UTC [208] DETAIL:  Process holding the lock: 135. Wait queue: 208.
 2024-04-11 20:31:06.564 UTC [208] STATEMENT:  UPDATE accounts SET balance = balance + 300 WHERE name = 'Alice';
 ```
-*В логах видим сообщения о блокировках строк: `process 135 still waiting for ShareLock on transaction 762 after 1004.906 ms` и `process 208 still waiting for ExclusiveLock on tuple (0,22) of relation 16400 of database 5 after 1001.379 ms`. Сессии с pid=135 и pid=208 ожидают блокировку строки от сессий с pid=70 и pid=135 соответственно.*
+*В логах видим сообщения о блокировках строк: `process 135 still waiting for ShareLock on transaction 762 after 1004.906 ms` и `process 208 still waiting for ExclusiveLock on tuple (0,22) of relation 16400 of database 5 after 1001.379 ms`. Транзакции в сессиях с pid=135 и pid=208 ожидают блокировку строки от транзакций в сессиях с pid=70 и pid=135 соответственно.*
 
 > ВОПРОС:
 >
 > почему в представлении `pg_locks` отсутствует информация о ShareLock для сессии с pid=135?
 
-### Выполним коммит в сессии с pid=70
+### Выполним коммит транзакции в сессии с pid=70
 ```psql
 [70] postgres=# COMMIT;
 COMMIT
@@ -313,7 +313,7 @@ postgres=# SELECT relation::REGCLASS, locktype, mode, granted, pid, pg_blocking_
 ```
 *В логах видим сообщение: `process 135 acquired ShareLock on transaction 762 after 1341779.632 ms` - сессия с pid=135 успешно получила блокировку ShareLock. В то же время сессия с pid=208 ожидает блокировку ShareLock от сессии с pid=135: `process 208 still waiting for ShareLock on transaction 763 after 1001.689 ms`*
 
-### Выполним коммит в сессии с pid=135
+### Выполним коммит транзакции в сессии с pid=135
 ```psql
 [135] postgres=# COMMIT;
 COMMIT
@@ -336,7 +336,7 @@ postgres=# SELECT relation::REGCLASS, locktype, mode, granted, pid, pg_blocking_
 ```
 *В логах видим сообщение: `process 208 acquired ShareLock on transaction 763 after 1665128.763 ms` - сессия с pid=208 успешно получила блокировку ShareLock*
 
-### Выполним коммит в сессии с pid=208
+### Выполним коммит транзакции в сессии с pid=208
 ```psql
 [208] postgres=# COMMIT;
 COMMIT
@@ -443,7 +443,7 @@ postgres=#  select * from accounts;
 ```
 *Благодаря тому, что перевод от Charlie к Alice происходил в рамках одной транзакции, данные в таблице accounts остались целостными*
 
-### Изучим логи в терминале
+### Изучим журнал сервера
 ```log
 2024-04-16T21:17:44.251190805Z 2024-04-16 21:17:44.249 UTC [70] LOG:  process 70 still waiting for ShareLock on transaction 776 after 1006.040 ms
 2024-04-16T21:17:44.252650597Z 2024-04-16 21:17:44.249 UTC [70] DETAIL:  Process holding the lock: 135. Wait queue: 70.
@@ -478,7 +478,7 @@ postgres=#  select * from accounts;
  2024-04-16 21:18:51.801 UTC [135] STATEMENT:  UPDATE accounts SET balance = balance + 200 WHERE name = 'Charlie';
  2024-04-16 21:18:51.801 UTC [135] LOG:  duration: 35658.221 ms  statement: UPDATE accounts SET balance = balance + 200 WHERE name = 'Charlie';
 ```
-*После возникновения Deadlock в третьем терминале с pid=208, сессия была прервана. В логах видим сообщение: `process 208 detected deadlock while waiting for ShareLock on transaction 775 after 1002.675 ms`.*
+*После возникновения Deadlock в третьем терминале с pid=208, транзакция была прервана. В логах видим сообщение: `process 208 detected deadlock while waiting for ShareLock on transaction 775 after 1002.675 ms`.*
 
 ### Проверим статистику `pg_stat_database`
 ```psql
@@ -562,6 +562,12 @@ postgres=# EXPLAIN (ANALYZE, BUFFERS) UPDATE accounts SET balance = balance + 1;
 *Видим, что план выполнения запроса предполагает последовательное обновление всех строк в таблице `accounts`. Так-как строки таблицы вставлялись в порядке увеличения `id`, то блокировки строк будут запрашиваться в порядке увеличения `id`*
 
 ### Для изменения порядка выполнения запроса будем использовать механизм DECLARE cursor_name CURSOR.
+> `DECLARE cursor_name CURSOR FOR query`
+>
+> Создает курсор, который позволяет выполнять запрос и обрабатывать результаты по одной строке за раз. Курсоры могут использоваться для обработки больших объемов данных, когда необходимо обработать одну строку за раз, а не все сразу.
+>
+> См. далее: https://postgrespro.ru/docs/postgresql/14/ecpg-sql-declare
+
 В целях отладки для каждой сессии будем увеличивать таймаут проверки взаимоблокировок командой
 ```sql
 SET LOCAL deadlock_timeout = '30s';
@@ -671,7 +677,7 @@ xids       | {811}
 modes      | {"For Update"}
 pids       | {135}
 ```
-*Ничего не изменилось, запись о том, что сессия с pid=70 ожидает блокировку строки от сессии с pid=135 отсутствует*
+*Ничего не изменилось, запись о том, что сессия с pid=70 ожидает блокировку строки (0,15) от сессии с pid=135 отсутствует*
 ### В первой сессии (pid=70) через 30 секунд видим сообщение о Deadlock
 ```psql
 ERROR:  deadlock detected
@@ -698,6 +704,8 @@ xids       | {811}
 modes      | {"For Update"}
 pids       | {135}
 ```
+*Видим, что блокировки для транакции сессии с pid=70 отсутствуют*
+
 ### Коммитим транзакции в сессиях с pid=70 и pid=135
 ```psql
 [70] postgres=#! COMMIT;
