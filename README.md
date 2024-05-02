@@ -7,3 +7,4 @@
   - [Занятие 8. MVCC, vacuum и autovacuum](https://github.com/iltvr/dba/tree/main/topic-5/README.md)
   - [Занятие 9. Работа с журналами](https://github.com/iltvr/dba/tree/main/topic-6/README.md)
   - [Занятие 10. Блокировки](https://github.com/iltvr/dba/tree/main/topic-7/README.md)
+  - [Занятие 11. Настройка PostgreSQL](https://github.com/iltvr/dba/tree/main/topic-8/README.md)
