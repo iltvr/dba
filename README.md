@@ -9,3 +9,4 @@
   - [Занятие 10. Блокировки](https://github.com/iltvr/dba/tree/main/topic-7/README.md)
   - [Занятие 11. Настройка PostgreSQL](https://github.com/iltvr/dba/tree/main/topic-8/README.md)
   - [Занятие 12. Резервное копирование и восстановление](https://github.com/iltvr/dba/tree/main/topic-9/README.md)
+  - [Занятие 13. Виды и устройство репликации в PostgreSQL](https://github.com/iltvr/dba/tree/main/topic-10/README.md)
